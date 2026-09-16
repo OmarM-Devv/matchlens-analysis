@@ -43,11 +43,14 @@ services:
 
   loader:
     <<: [*app-image, *hardening]
-    command: ["python", "-m", "db.loader", "--data-dir", "/data/statsbomb"]
+    command: ["python", "-m", "loader.cleaner", "--data-dir", "/data/statsbomb"]
     environment:
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-matchlens}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-matchlens}
       MATCHLENS_EXPECTED_MATCHES: ${MATCHLENS_EXPECTED_MATCHES:-38}
-      MATCHLENS_EXPECTED_SHOTS: ${MATCHLENS_EXPECTED_SHOTS:-1086}
+      MATCHLENS_EXPECTED_SHOTS: ${MATCHLENS_EXPECTED_SHOTS:-1042}
+      MATCHLENS_COMPETITION_ID: ${MATCHLENS_COMPETITION_ID:-2}
+      MATCHLENS_SEASON_ID: ${MATCHLENS_SEASON_ID:-27}
+      MATCHLENS_TEAM_ID: ${MATCHLENS_TEAM_ID:-22}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     volumes:
       - ./data:/data:ro
@@ -62,6 +65,7 @@ services:
     <<: [*app-image, *hardening]
     restart: unless-stopped
     environment:
+      MATCHLENS_TEAM_ID: ${MATCHLENS_TEAM_ID:-22}
       # Read-only role: the API can SELECT and nothing else.
       DATABASE_URL: postgresql+psycopg://${MATCHLENS_RO_USER:-matchlens_ro}:${MATCHLENS_RO_PASSWORD}@db:5432/${POSTGRES_DB:-matchlens}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}

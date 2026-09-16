@@ -1,0 +1,77 @@
+{% extends "base.html" %}
+{% block title %}MatchLens · {{ team_name or "Season" }}{% endblock %}
+{% block content %}
+  <h1>{{ team_name or "MatchLens" }}{% if team_name %} · season overview{% endif %}</h1>
+  <p class="sub">Official results with StatsBomb shot data. All figures are computed in PostgreSQL from <code>sql/queries.sql</code>.</p>
+
+{% if not fixtures %}
+  <div class="card"><p class="empty">No data loaded yet. Run the loader: <code>python -m loader.cleaner</code></p></div>
+{% else %}
+  <h2>Home vs away</h2>
+  <div class="card">
+    <table>
+      <thead>
+        <tr>
+          <th class="l">Venue</th><th>P</th><th>W</th><th>D</th><th>L</th><th>Pts</th><th>Pts/match</th>
+          <th>GF</th><th>GA</th><th>Shots</th><th>On target</th><th>Shots against</th>
+          <th>xG</th><th>xGA</th><th>xG/match</th><th>xGA/match</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for v in home_away.venues %}
+        <tr>
+          <td class="l">{{ v.venue }}</td><td>{{ v.played }}</td><td>{{ v.wins }}</td><td>{{ v.draws }}</td>
+          <td>{{ v.losses }}</td><td><b>{{ v.points }}</b></td><td>{{ "%.2f"|format(v.points_per_match) }}</td>
+          <td>{{ v.goals_for }}</td><td>{{ v.goals_against }}</td><td>{{ v.shots }}</td>
+          <td>{{ v.shots_on_target }}</td><td>{{ v.shots_against }}</td>
+          <td>{{ "%.2f"|format(v.xg) }}</td><td>{{ "%.2f"|format(v.xg_against) }}</td>
+          <td>{{ "%.2f"|format(v.xg_per_match) }}</td><td>{{ "%.2f"|format(v.xg_against_per_match) }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <h2>Rolling {{ window }}-match form</h2>
+  <form method="get">
+    <label>Window
+      <input type="number" name="window" min="1" max="38" value="{{ window }}">
+    </label>
+    <button type="submit">Update</button>
+  </form>
+  <div class="card">
+    <table>
+      <thead>
+        <tr>
+          <th>#</th><th class="l">Date</th><th class="l">Opponent</th><th>Score</th><th>Res</th>
+          <th>xG</th><th>xGA</th><th class="l">Form</th><th class="l">Rolling pts</th>
+          <th>GD</th><th>xG avg</th><th>xGA avg</th><th>Total pts</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for m in form.matches %}
+        <tr>
+          <td>{{ m.match_number }}</td>
+          <td class="l">{{ m.match_date.isoformat() }}</td>
+          <td class="l"><a href="/matches/{{ m.match_id }}">{{ "vs" if m.is_home else "@" }} {{ m.opponent_name }}</a></td>
+          <td>{{ m.goals_for }}–{{ m.goals_against }}</td>
+          <td><span class="res {{ m.result }}">{{ m.result }}</span></td>
+          <td>{{ "%.2f"|format(m.xg) }}</td>
+          <td>{{ "%.2f"|format(m.xg_against) }}</td>
+          <td class="l form">{{ m.form }}</td>
+          <td class="l bar">
+            <span style="width: {{ (100 * m.rolling_points / (3 * window))|round(1) }}%"></span>
+            <b>{{ m.rolling_points }}</b> / {{ 3 * m.games_in_window }}
+          </td>
+          <td>{{ "%+d"|format(m.rolling_goal_diff) }}</td>
+          <td>{{ "%.2f"|format(m.rolling_xg) }}</td>
+          <td>{{ "%.2f"|format(m.rolling_xg_against) }}</td>
+          <td>{{ m.cumulative_points }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <p class="note">Goals and points come from the official score. xG and xGA are sums of StatsBomb shot xG.</p>
+{% endif %}
+{% endblock %}

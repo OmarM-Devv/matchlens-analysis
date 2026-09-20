@@ -91,9 +91,17 @@ trigger does it.
 written by `scripts/fetch_statsbomb.py`.
 
 Before any database write, the snapshot is validated. It is rejected unless it
-has exactly 38 matches and 1,042 shots, no duplicate match or shot ids, every
-match in the expected competition-season, every shot credited to a team in its
-match, an events file for every match, and one name per team id.
+has exactly 38 matches and 1,042 shot events, no duplicate match or shot ids,
+every match in the expected competition-season, every shot credited to a team
+in its match, an events file for every match, and one name per team id.
+
+A shot event with no `statsbomb_xg` value is **set aside** rather than
+rejecting the snapshot. It is not written to `shots`, and each one is logged
+as a warning with its shot id, match, team and minute. Set-aside shots still
+count towards the 1,042 total, so the guard keeps checking how many shot events
+StatsBomb published. The summary line reports how many were set aside. Any
+other malformed shot field still rejects the snapshot. The current StatsBomb
+data has an xG value on all 1,042 shots, so nothing is set aside today.
 
 The import then runs as **one PostgreSQL transaction** holding
 `pg_advisory_xact_lock(competition_id, season_id)`:
@@ -105,6 +113,7 @@ The import then runs as **one PostgreSQL transaction** holding
 | Match missing from a new snapshot | Match pruned; its shots cascade away |
 | Any database error mid-import | Full rollback; the previous import is untouched |
 | Count or consistency check fails | Rejected before a transaction is opened |
+| Shot event without `statsbomb_xg` | Set aside and logged; not loaded; still counted towards the expected total |
 | Two imports at once | Serialised by the advisory lock; no duplicates |
 | Database unreachable | Gives up after the 10 s connect timeout with exit code 1; nothing written |
 
@@ -211,16 +220,17 @@ TEST_DATABASE_URL=postgresql+psycopg://matchlens:<password>@127.0.0.1:5432/match
 
 The suite has 16 tests containing 31 assertions. Each session creates a
 throwaway schema and drops it afterwards. The fixture is a synthetic 6-match
-season (33 shots, one own goal, and one match the focus team did not play).
+season (34 shot events, one of them without xG; one own goal; and one match
+the focus team did not play).
 
 | Area | What is asserted |
 |---|---|
-| First import | Only the focus team's matches load; counts for teams, matches, shots and the team view |
+| First import | Only the focus team's matches load; the shot without xG is set aside but counted; counts for teams, matches, shots and the team view |
 | Repeat import | Idempotent: counts and shot rows unchanged, `loaded_at` advances |
 | Upstream corrections | Changed score updates the result and points; removed shot disappears |
 | Pruning | A match dropped from the snapshot is deleted along with its shots |
 | Rollback | A constraint failure mid-import leaves matches and shots exactly as before |
-| Validation | Wrong shot count, shot for a team not in the match, and missing events file are rejected with nothing written |
+| Validation | Wrong shot count (reported as loaded plus set aside), shot for a team not in the match, and missing events file are rejected with nothing written |
 | Schema | The team-in-match trigger, the xG range CHECK and the distinct-teams CHECK reject bad rows; the pre-refactor layout is refused |
 | Concurrency | Two simultaneous imports serialise with no duplicates |
 | Match report | Official goals, goals from shots, goals not from shots, shots, shots on target and xG for both sides |
@@ -275,6 +285,8 @@ query-plan notes:
   Leicester.
 - The 1,042-shot guard is tied to the current StatsBomb release. An upstream
   revision will make imports fail until the expected count is updated.
+- Shots without an xG value are set aside, not loaded, so they are missing
+  from shot counts and xG totals (none in the current data).
 - xG is StatsBomb's value as provided, penalties included. The model version is
   not recorded.
 - Own goals are derived (official goals minus goals from shots), not stored as

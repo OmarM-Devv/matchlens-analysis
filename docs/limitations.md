@@ -11,7 +11,8 @@ not cover, and the query-plan observations behind the performance notes.
   appear only in their matches against Leicester, so any opponent figure covers
   one or two games, not their season.
 - **Counts are pinned to the current upstream snapshot.** The loader refuses a
-  snapshot unless it has exactly 38 matches and 1,042 shot events. 1,042 is the
+  snapshot unless it has exactly 38 matches and 1,042 shot events, counting
+  any shots set aside for missing xG (see below). 1,042 is the
   number of shot events in StatsBomb's open data for those 38 matches, counted on
   28 September 2026. StatsBomb revises open data from time to time. If a
   revision changes the count, imports fail until `MATCHLENS_EXPECTED_SHOTS` is
@@ -25,6 +26,11 @@ not cover, and the query-plan observations behind the performance notes.
 - **xG is StatsBomb's value, not ours.** `shots.statsbomb_xg` is stored as
   provided. The provider's model version is not recorded, and a later data
   revision may change historical values.
+- **Shots without xG are set aside.** A shot event with no `statsbomb_xg` is
+  logged and not loaded, so it is missing from shots, shots on target, goals
+  from shots and xG in every query. A goal set aside this way would appear as a
+  "goal not from shots" in the match report. None of the 1,042 current shots
+  lacks xG.
 - **Penalties are included** in shots and xG. There is no non-penalty xG split.
 - **Official goals vs shot goals.** Goals, results and points come from the
   official score in the match record. StatsBomb records own goals as separate
@@ -60,7 +66,8 @@ not cover, and the query-plan observations behind the performance notes.
   timeout, and connects with a 3-second connect timeout.
 - There is no caching or pagination. Every page load runs its queries, which is
   fine at this data size (see below) and would need revisiting for more data.
-- The test suite runs on a small synthetic fixture (6 matches, 33 shots). The
+- The test suite runs on a small synthetic fixture (6 matches, 34 shot events,
+  one without xG). The
   real 38-match snapshot is checked by the loader's count guard at import time,
   not by the tests.
 

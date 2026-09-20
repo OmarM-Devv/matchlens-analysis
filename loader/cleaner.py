@@ -24,6 +24,11 @@ Any failure rolls the whole import back, leaving the previous successful
 import untouched. Snapshots that fail validation (including the exact 38-match
 and 1,042-shot counts) are rejected before a transaction is opened.
 
+Shot events without a ``statsbomb_xg`` value are set aside and logged instead
+of rejecting the snapshot. They are not written to ``shots``, but they still
+count towards the expected shot total, so the 1,042 guard keeps checking the
+number of shot events StatsBomb published.
+
 CLI:  python -m loader.cleaner --data-dir data/statsbomb
 """
 
@@ -37,7 +42,7 @@ import sys
 import uuid
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, time
 from pathlib import Path
 from typing import Any
@@ -83,10 +88,17 @@ class Dataset:
     teams: list[dict[str, Any]]
     matches: list[dict[str, Any]]
     shots: list[dict[str, Any]]
+    # Shot events without statsbomb_xg: not loaded, but counted and logged.
+    skipped_shots: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def match_ids(self) -> list[int]:
         return [m["match_id"] for m in self.matches]
+
+    @property
+    def shot_events(self) -> int:
+        """Every shot event in the snapshot, loaded or set aside."""
+        return len(self.shots) + len(self.skipped_shots)
 
 
 @dataclass(frozen=True)
@@ -99,6 +111,7 @@ class LoadReport:
     matches_pruned: int
     shots_written: int
     shots_replaced: int
+    shots_skipped: int = 0
 
 
 # --------------------------------------------------------------------------- engine and schema
@@ -197,12 +210,32 @@ def parse_shot(raw: Mapping[str, Any], match_id: int) -> dict[str, Any]:
         ) from exc
 
 
-def extract_shots(events: Iterable[Mapping[str, Any]], match_id: int) -> list[dict[str, Any]]:
-    return [
-        parse_shot(event, match_id)
-        for event in events
-        if (event.get("type") or {}).get("name") == "Shot"
-    ]
+def extract_shots(
+    events: Iterable[Mapping[str, Any]], match_id: int
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Split a match's shot events into loadable shots and shots set aside.
+
+    A shot is set aside only when ``statsbomb_xg`` is missing or null. Any
+    other malformed field still rejects the snapshot in ``parse_shot``.
+    """
+    shots: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    for event in events:
+        if (event.get("type") or {}).get("name") != "Shot":
+            continue
+        if (event.get("shot") or {}).get("statsbomb_xg") is None:
+            skipped.append(
+                {
+                    "shot_id": event.get("id", "?"),
+                    "match_id": match_id,
+                    "team_id": (event.get("team") or {}).get("id"),
+                    "minute": event.get("minute"),
+                    "reason": "missing statsbomb_xg",
+                }
+            )
+            continue
+        shots.append(parse_shot(event, match_id))
+    return shots, skipped
 
 
 def involves_team(raw: Mapping[str, Any], team_id: int) -> bool:
@@ -221,7 +254,7 @@ def build_dataset(
     """Parse the focus team's matches and their shots. Team names are taken
     from the match records; a team id seen with two names is rejected."""
     team_names: dict[int, set[str]] = {}
-    matches, shots = [], []
+    matches, shots, skipped = [], [], []
     for raw in raw_matches:
         if not involves_team(raw, team_id):
             continue
@@ -231,13 +264,15 @@ def build_dataset(
         for side in ("home", "away"):
             team_names.setdefault(match[f"{side}_team_id"], set()).add(match[f"{side}_team_name"])
         matches.append(match)
-        shots.extend(extract_shots(events_by_match[match["match_id"]], match["match_id"]))
+        match_shots, match_skipped = extract_shots(events_by_match[match["match_id"]], match["match_id"])
+        shots.extend(match_shots)
+        skipped.extend(match_skipped)
 
     conflicting = {tid: sorted(names) for tid, names in team_names.items() if len(names) > 1}
     if conflicting:
         raise DataValidationError(f"team ids with more than one name: {conflicting}")
     teams = [{"team_id": tid, "team_name": next(iter(names))} for tid, names in sorted(team_names.items())]
-    return Dataset(competition_id, season_id, team_id, teams, matches, shots)
+    return Dataset(competition_id, season_id, team_id, teams, matches, shots, skipped)
 
 
 def read_statsbomb(data_dir: Path | str, competition_id: int, season_id: int, team_id: int) -> Dataset:
@@ -286,8 +321,13 @@ def validate_dataset(
         errors.append(f"snapshot contains no matches for team {dataset.team_id}")
     if expected_matches is not None and len(dataset.matches) != expected_matches:
         errors.append(f"expected {expected_matches} matches, found {len(dataset.matches)}")
-    if expected_shots is not None and len(dataset.shots) != expected_shots:
-        errors.append(f"expected {expected_shots} shots, found {len(dataset.shots)}")
+    # Shots set aside for missing xG still count: the guard checks how many shot
+    # events the source published, not how many had an xG value.
+    if expected_shots is not None and dataset.shot_events != expected_shots:
+        errors.append(
+            f"expected {expected_shots} shots, found {dataset.shot_events}"
+            f" ({len(dataset.shots)} with xG, {len(dataset.skipped_shots)} set aside without xG)"
+        )
 
     for match_id, n in Counter(dataset.match_ids).items():
         if n > 1:
@@ -407,6 +447,7 @@ def _load_in_transaction(conn: Connection, ds: Dataset) -> LoadReport:
         matches_pruned=pruned,
         shots_written=len(ds.shots),
         shots_replaced=shots_replaced,
+        shots_skipped=len(ds.skipped_shots),
     )
     log.info("import committed: %s", report)
     return report
@@ -448,6 +489,11 @@ def import_statsbomb(
     """Read, validate and load one team's competition-season snapshot."""
     dataset = read_statsbomb(data_dir, competition_id, season_id, team_id)
     validate_dataset(dataset, expected_matches=expected_matches, expected_shots=expected_shots)
+    for shot in dataset.skipped_shots:
+        log.warning(
+            "shot %s (match %s, team %s, minute %s) set aside: %s",
+            shot["shot_id"], shot["match_id"], shot["team_id"], shot["minute"], shot["reason"],
+        )
     return load_dataset(engine, dataset)
 
 
@@ -496,7 +542,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(
         f"Loaded team {report.team_id}, competition {report.competition_id} season {report.season_id}: "
         f"{report.matches_inserted} matches inserted, {report.matches_updated} updated, "
-        f"{report.matches_pruned} pruned; {report.shots_written} shots ({report.shots_replaced} replaced)."
+        f"{report.matches_pruned} pruned; {report.shots_written} shots ({report.shots_replaced} replaced, "
+        f"{report.shots_skipped} set aside without xG)."
     )
     return 0
 

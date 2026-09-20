@@ -33,6 +33,9 @@ SCORES = [(2, 0), (1, 1), (0, 1), (3, 2), (2, 2), (0, 2)]
 # In the opening match one of the focus team's two goals is an opponent own
 # goal: an "Own Goal For" event, not a shot.
 OWN_GOAL_MATCH = 0
+# In the third match the focus team has one extra shot event without
+# statsbomb_xg, which the loader must set aside rather than load.
+NO_XG_MATCH = 2
 # Shots per match: focus team = shot goals + Saved + Off T; opponent = goals + Saved.
 MISSES = {"focus": [("Saved", 0.10), ("Off T", 0.05)], "opponent": [("Saved", 0.10)]}
 GOAL_XG = 0.40
@@ -149,6 +152,10 @@ def build_fixture(root: Path) -> StatsBombFixture:
                 index += 1
             match_events.append(_event(match_id, index, "Pass", team))
             index += 1
+        if i == NO_XG_MATCH:
+            no_xg = _shot(match_id, index, FOCUS_TEAM, "Off T", 0.0)
+            del no_xg["shot"]["statsbomb_xg"]
+            match_events.append(no_xg)
         events[match_id] = match_events
 
     # A match the focus team did not play; it has no events file and must be skipped.

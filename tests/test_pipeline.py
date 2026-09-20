@@ -2,8 +2,9 @@
 and the web application built on it.
 
 The fixture dataset (tests/conftest.py) is 6 focus-team matches with results
-W D L W D L, 33 shot events, one own goal, non-shot events mixed in, and one
-match the focus team did not play (which the loader must skip).
+W D L W D L, 34 shot events (33 with xG, one without, which the loader sets
+aside), one own goal, non-shot events mixed in, and one match the focus team
+did not play (which the loader must skip).
 """
 
 from __future__ import annotations
@@ -26,7 +27,8 @@ pytestmark = pytest.mark.integration
 
 TOTAL_TEAMS = 7
 TOTAL_MATCHES = 6
-TOTAL_SHOTS = 33
+TOTAL_SHOTS = 33  # loaded: shot events with statsbomb_xg
+SHOT_EVENTS = 34  # every shot event, including the one set aside without xG
 FOCUS_TEAM_ID = FOCUS_TEAM[0]
 
 
@@ -63,9 +65,12 @@ def client_for(engine: Engine) -> TestClient:
 
 
 def test_first_import_loads_only_the_focus_teams_matches(db: Engine, sb: StatsBombFixture) -> None:
-    report = run_import(db, sb, expected_matches=TOTAL_MATCHES, expected_shots=TOTAL_SHOTS)
+    # The expected count covers every shot event; the one without xG is set aside, not loaded.
+    report = run_import(db, sb, expected_matches=TOTAL_MATCHES, expected_shots=SHOT_EVENTS)
 
-    assert (report.matches_inserted, report.matches_updated, report.shots_written) == (TOTAL_MATCHES, 0, TOTAL_SHOTS)
+    assert (report.matches_inserted, report.matches_updated, report.shots_written, report.shots_skipped) == (
+        TOTAL_MATCHES, 0, TOTAL_SHOTS, SHOT_EVENTS - TOTAL_SHOTS,
+    )
     assert table_counts(db) == (TOTAL_TEAMS, TOTAL_MATCHES, TOTAL_SHOTS)
     with db.connect() as conn:
         assert conn.execute(text("SELECT COUNT(*) FROM team_match_view")).scalar_one() == 2 * TOTAL_MATCHES
@@ -155,7 +160,7 @@ def test_database_error_rolls_back_the_entire_import(db: Engine, sb: StatsBombFi
 
 
 def test_count_mismatch_is_rejected_before_writing(db: Engine, sb: StatsBombFixture) -> None:
-    with pytest.raises(DataValidationError, match="expected 1042 shots, found 33"):
+    with pytest.raises(DataValidationError, match=r"expected 1042 shots, found 34 \(33 with xG, 1 set aside without xG\)"):
         run_import(db, sb, expected_matches=TOTAL_MATCHES, expected_shots=1042)
     assert table_counts(db) == (0, 0, 0)
 

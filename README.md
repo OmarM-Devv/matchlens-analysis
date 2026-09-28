@@ -1,13 +1,117 @@
 # MatchLens Football Analysis
 
+[![ci](https://github.com/OmarM-Devv/matchlens-analysis/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/OmarM-Devv/matchlens-analysis/actions/workflows/ci.yml)
+
 Descriptive match analysis of Leicester City's 2015/16 Premier League season, built on StatsBomb open data, PostgreSQL and FastAPI.
 
-## Screenshot
-
-![Match report: Manchester City 1–3 Leicester City, 6 February 2016](docs/screenshots/match-report.png)
+![Match report: Manchester City 1–3 Leicester City, 6 February 2016](docs/images/match-report.png)
 
 The match-report page (`/matches/{match_id}`), captured from a local run against
 the loaded 2015/16 data.
+
+## At a Glance
+
+| | |
+|---|---|
+| What it does | Loads one team's season of StatsBomb event data into PostgreSQL, validates it, and serves match reports, rolling form and home/away splits as web pages and JSON |
+| Data | 38 matches and 1,042 shot events: Premier League 2015/16 (StatsBomb competition 2, season 27), Leicester City (team 22) |
+| Stack | Python 3.12, PostgreSQL 16, SQLAlchemy 2.0, FastAPI, Docker Compose, GitHub Actions |
+| Tests | 16 PostgreSQL integration tests (31 assertions), run in CI on every push to `main` and every pull request |
+| Status | Runs locally under Docker Compose. CI only; not deployed |
+| Evidence | [System verification](#system-verification): screenshots, each with the command that reproduces it. [Failure exercise](docs/failure_diagnosis.md): a recorded database outage |
+| Design decisions | Four [architecture decision records](docs/adr/) covering the options considered and the trade-offs |
+
+The cloud deployment side of my work (Terraform, AWS, OIDC, CI/CD) is in
+[rail-data-pipeline-api](https://github.com/OmarM-Devv/rail-data-pipeline-api).
+
+## Skills Demonstrated
+
+### Software engineering
+
+- **Separation of concerns.** SQL lives in [`sql/`](sql/), not in Python
+  strings. The loader ([`loader/cleaner.py`](loader/cleaner.py)) parses,
+  validates and writes. The web app ([`app/main.py`](app/main.py)) loads the
+  named queries from `sql/queries.sql` and returns typed Pydantic models.
+- **Validation before any write.** `validate_dataset()` rejects a snapshot
+  before a transaction is opened: wrong match or shot count, duplicate ids, a
+  match from the wrong competition-season, a shot credited to a team not in its
+  match, a missing events file, or a team id with two names. The database
+  enforces the same rules again with CHECK constraints and a trigger.
+- **Missing-xG fallback.** `extract_shots()` in `loader/cleaner.py` sets aside
+  a shot event whose `statsbomb_xg` is missing or null instead of rejecting the
+  whole snapshot. Each one is logged with its shot id, match, team and minute,
+  and the rest of the batch loads. Set-aside shots still count towards the
+  1,042 guard, so a shot silently deleted upstream is still caught. Any other
+  malformed shot field still rejects the snapshot. The current StatsBomb data
+  has xG on all 1,042 shots, so the fallback is exercised by the test fixture
+  (one shot without xG, [Figure 4](#figure-4--missing-xg-fallback)), not by the
+  real data. See [ADR 0002](docs/adr/0002-set-aside-shots-missing-xg.md).
+- **Fault handling.** Every import is one transaction under
+  `pg_advisory_xact_lock`, so a failure rolls back completely and two imports
+  cannot interleave. Connect timeouts (3 s for the app, 10 s for the loader)
+  were added after the failure exercise found a 130-second hang. The app
+  returns 503 while the database is down and recovers without a restart.
+  See [ADR 0001](docs/adr/0001-single-transaction-with-advisory-lock.md).
+- **Test patterns.** Integration tests run against a real PostgreSQL in a
+  throwaway schema, using a synthetic StatsBomb-shaped fixture. They cover
+  idempotency, upstream corrections, pruning, rollback, concurrent imports,
+  schema constraints, the aggregate-before-join totals and a database outage.
+
+### Data engineering
+
+- **Scoped, guarded ingestion.** The import is pinned to competition 2,
+  season 27, team 22 and refuses a snapshot unless it has exactly 38 matches
+  and 1,042 shot events. These are data-quality guards, not performance
+  settings: they exist to catch silent upstream changes. They are configurable
+  (`MATCHLENS_EXPECTED_*`, `--no-count-check`).
+- **Idempotent loads.** Teams and matches are upserted, matches missing from a
+  new snapshot are pruned, and shots are replaced. Re-running the import leaves
+  row counts unchanged, and a post-load count check rolls back on any mismatch.
+- **Isolated query management.** The schema (`sql/schema.sql`) and the four
+  named queries (`sql/queries.sql`) are plain SQL files. Rolling form uses
+  window functions with `ROWS` frames. See
+  [ADR 0004](docs/adr/0004-keep-sql-in-named-sql-files.md).
+- **Aggregate before join.** Every analytical query groups `shots` to one row
+  per `(match_id, team_id)` in a CTE before joining to `team_match_view`.
+  Joining raw shots first would repeat each match's goals and points once per
+  shot. `test_home_away_aggregates_shots_before_joining` pins the correct
+  totals. See [ADR 0003](docs/adr/0003-aggregate-shots-before-joining.md).
+- **Measured, not assumed, performance.** A covering index serves the
+  per-(match, team) aggregation. `EXPLAIN ANALYZE` on the real data showed the
+  planner prefers a sequential scan at 1,042 rows (about 1 ms), so the index is
+  kept for larger volumes with no benefit claimed at this size. See
+  [`docs/limitations.md`](docs/limitations.md).
+- **Orchestrated run order.** Compose starts the database, waits for it to be
+  healthy, runs the loader to completion, and only then starts the API.
+
+### DevOps
+
+- **Container image.** Multi-stage [`Dockerfile`](Dockerfile): dependencies
+  resolved in a builder stage, a slim runtime running as non-root UID 10001, a
+  `HEALTHCHECK` on `/health`, and a separate test stage.
+- **Hardened Compose stack.** [`docker-compose.yml`](docker-compose.yml) runs
+  the app containers with a read-only root filesystem, all Linux capabilities
+  dropped and `no-new-privileges`. Ports bind to `127.0.0.1` only.
+- **Least-privilege database access.** The API connects as a role with
+  `SELECT` grants only, `default_transaction_read_only`, and a 5-second
+  statement timeout ([`docker/postgres/initdb/`](docker/postgres/initdb/)).
+- **Continuous integration.** [`.github/workflows/ci.yml`](.github/workflows/ci.yml)
+  starts a `postgres:16-alpine` service container and runs the suite on
+  Python 3.12. When `CI` is set and no database is configured, the fixture
+  fails instead of skipping, so the job cannot pass without running the
+  integration tests.
+- **Incident practice.** A controlled PostgreSQL outage was run, diagnosed,
+  fixed and repeated on the compose stack, with a written runbook
+  ([`docs/failure_diagnosis.md`](docs/failure_diagnosis.md)).
+
+## Documentation
+
+| Document | Kind | Use it to |
+|---|---|---|
+| [Setup](#setup) | Tutorial | Run the whole stack from a fresh clone |
+| [Testing](#testing) and the [outage runbook](docs/failure_diagnosis.md#runbook-compose-stack) | How-to | Run the tests; diagnose and recover from a database outage |
+| [Data Model](#data-model), [Metric Definitions](#metric-definitions), and the OpenAPI docs at `/docs` | Reference | Look up tables, constraints, metric definitions and endpoints |
+| [Architecture decision records](docs/adr/) and [limitations](docs/limitations.md) | Explanation | Understand why the design is the way it is, and what it does not cover |
 
 ## Project Scope
 
@@ -52,7 +156,7 @@ app/templates/                 pages: / (season overview) · /matches/{id} (matc
 tests/                         PostgreSQL integration suite (16 tests, 31 assertions)
 docker/postgres/initdb/        creates the read-only role the app connects as
 .github/workflows/ci.yml       runs the suite on every push to main and every pull request
-docs/                          limitations.md · failure_diagnosis.md · screenshots/
+docs/                          adr/ · limitations.md · failure_diagnosis.md · images/
 ```
 
 ## Data and Scope
@@ -156,7 +260,8 @@ each match's goals and points once per shot. The test
 ## Setup
 
 Requires Git, Docker with Compose, and Python 3 on the host (the fetch script
-uses only the standard library).
+uses only the standard library). The commands work in bash and in
+PowerShell 7 unless marked otherwise.
 
 ```bash
 git clone https://github.com/OmarM-Devv/matchlens-analysis.git
@@ -218,6 +323,13 @@ Or, against any PostgreSQL where the role can `CREATE SCHEMA`:
 TEST_DATABASE_URL=postgresql+psycopg://matchlens:<password>@127.0.0.1:5432/matchlens pytest
 ```
 
+In PowerShell 7:
+
+```powershell
+$env:TEST_DATABASE_URL = "postgresql+psycopg://matchlens:<password>@127.0.0.1:5432/matchlens"
+pytest
+```
+
 The suite has 16 tests containing 31 assertions. Each session creates a
 throwaway schema and drops it afterwards. The fixture is a synthetic 6-match
 season (34 shot events, one of them without xG; one own goal; and one match
@@ -275,6 +387,152 @@ the symptoms were observed, and the database was restored.
   without restarting `api`.
 
 The document also has the compose runbook used for that run.
+
+## System Verification
+
+Screenshots of the system running: terminal output captured on Linux with
+Docker Engine and rendered as images without editing, the season page
+from a browser, and one from GitHub Actions. Each figure lists the command
+that produced it, so a reviewer can reproduce it after the [Setup](#setup)
+steps. All images are in `docs/images/`:
+
+```
+docs/
+├── images/
+│   ├── match-report.png                  match report page (top of this README)
+│   ├── 01-loader-first-import.png        Figure 1
+│   ├── 02-loader-idempotent-rerun.png    Figure 2
+│   ├── 03-database-row-counts.png        Figure 3
+│   ├── 04-missing-xg-set-aside.png       Figure 4
+│   ├── 05-test-suite.png                 Figure 5
+│   ├── 06-ci-run.png                     Figure 6
+│   ├── 07-season-overview.png            Figure 7
+│   ├── 08-home-away-api.png              Figure 8
+│   └── 09-outage-and-recovery.png        Figure 9
+├── failure_diagnosis.md
+└── limitations.md
+```
+
+| Figure | What it shows | Area |
+|---|---|---|
+| 1 | Snapshot validated and committed in one transaction | Data engineering |
+| 2 | Re-running the import changes nothing | Data engineering |
+| 3 | 20 teams, 38 matches, 1,042 shots in PostgreSQL | Data engineering |
+| 4 | A shot without xG is set aside and logged; the import still succeeds | Software engineering |
+| 5 | 16 integration tests pass against PostgreSQL | Software engineering |
+| 6 | The same suite passes in GitHub Actions | DevOps |
+| 7 | Season overview page served from the database | Software engineering |
+| 8 | Home/away totals add up to the official record (aggregate before join) | Data engineering |
+| 9 | Database outage returns a fast 503, then recovers without a restart | DevOps |
+
+### Figure 1 · First import
+
+![Loader output: 38 matches inserted, 1,042 shots, 0 set aside without xG](docs/images/01-loader-first-import.png)
+
+The one-shot `loader` container validated the snapshot (competition 2,
+season 27, 38 matches, 1,042 shot events) and committed it in a single
+transaction. The summary line reports 38 matches inserted and 1,042 shots
+written, with none set aside.
+
+```bash
+docker compose up -d --build
+docker compose logs --no-log-prefix loader
+```
+
+### Figure 2 · Idempotent re-run
+
+![Loader re-run: 0 inserted, 38 updated, 1,042 shots replaced](docs/images/02-loader-idempotent-rerun.png)
+
+Running the same import again updates the 38 matches in place and replaces the
+1,042 shots. Nothing is duplicated.
+
+```bash
+docker compose run --rm loader
+```
+
+### Figure 3 · Row counts in PostgreSQL
+
+![psql query showing 20 teams, 38 matches and 1,042 shots](docs/images/03-database-row-counts.png)
+
+Counts read straight from the database after the import.
+
+```bash
+docker compose exec db psql -U matchlens -d matchlens -c "SELECT (SELECT count(*) FROM teams) AS teams, (SELECT count(*) FROM matches) AS matches, (SELECT count(*) FROM shots) AS shots;"
+```
+
+### Figure 4 · Missing-xG fallback
+
+![pytest live log: shot set aside for missing statsbomb_xg, test passed](docs/images/04-missing-xg-set-aside.png)
+
+The fixture includes one shot event without `statsbomb_xg`. The loader logs a
+warning naming the shot, match, team and minute, sets it aside, and loads the
+rest of the batch. The test then checks that it was counted but not written.
+
+```bash
+docker compose --profile test run --rm tests pytest -p no:cacheprovider -o log_cli=true --log-cli-level=WARNING -k test_first_import
+```
+
+### Figure 5 · Test suite
+
+![pytest verbose output: 16 passed](docs/images/05-test-suite.png)
+
+All 16 integration tests pass against the compose PostgreSQL, each session in
+its own throwaway schema.
+
+```bash
+docker compose --profile test run --rm tests pytest -v -p no:cacheprovider
+```
+
+### Figure 6 · CI run
+
+![GitHub Actions ci workflow: test job passed with a postgres service container](docs/images/06-ci-run.png)
+
+The `ci` workflow on GitHub Actions: a `postgres:16-alpine` service container
+and the same 16 tests on Python 3.12. The image shows the job's steps and the
+pytest section of its log, as returned by the GitHub API; the run itself is
+[ci run #6](https://github.com/OmarM-Devv/matchlens-analysis/actions/runs/36496439029).
+
+### Figure 7 · Season overview page
+
+![Leicester City season overview: home vs away table and rolling 5-match form](docs/images/07-season-overview.png)
+
+The season overview page at `http://127.0.0.1:8000/`: the home vs away table
+and the rolling 5-match form, rendered from the named queries in `sql/`.
+
+### Figure 8 · Home vs away through the API
+
+![Home and away rows from /api/home-away](docs/images/08-home-away-api.png)
+
+Home: 19 played, 12 won, 6 drawn, 1 lost. The two rows add up to the official
+23 wins, 12 draws, 3 defeats and 81 points, which only holds because shots are
+aggregated before the join.
+
+```bash
+curl -s http://127.0.0.1:8000/api/home-away | jq -c '.venues[] | {venue, played, wins, draws, losses, points, goals_for, goals_against, xg, xg_against}'
+```
+
+In PowerShell 7:
+
+```powershell
+(Invoke-RestMethod http://127.0.0.1:8000/api/home-away).venues | Format-Table venue, played, wins, draws, losses, points, goals_for, goals_against, xg, xg_against
+```
+
+### Figure 9 · Outage and recovery
+
+![curl: 503 immediately while db is stopped, then 200 after restart](docs/images/09-outage-and-recovery.png)
+
+With the database container stopped, `/health` returns 503 straight away
+instead of hanging (0.01 s in this run on Linux; about 4 s on Docker Desktop
+in the recorded [failure exercise](docs/failure_diagnosis.md)). Once `db` is
+healthy again, it returns 200 without restarting `api`.
+
+```bash
+docker compose stop db
+curl -s -w ' [%{http_code}] %{time_total}s\n' http://127.0.0.1:8000/health
+docker compose start db
+docker compose ps db
+curl -s -w ' [%{http_code}] %{time_total}s\n' http://127.0.0.1:8000/health
+```
 
 ## Limitations
 

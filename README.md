@@ -259,9 +259,12 @@ the symptoms were observed, and the database was restored.
 - **Recovered:** after PostgreSQL restarted, the app returned 200 again without
   a restart. Row counts were unchanged at 38 matches and 1,042 shots.
 
-The document also has a compose runbook for diagnosing and restoring an outage.
-The recorded run used a local PostgreSQL 16.4 under `pg_ctl` rather than the
-compose stack.
+- **Repeated on the compose stack** with `docker compose stop db`: 503s in
+  about 4 seconds (`Name or service not known`, because a stopped container's
+  hostname stops resolving), then recovery after `docker compose start db`
+  without restarting `api`.
+
+The document also has the compose runbook used for that run.
 
 ## Limitations
 

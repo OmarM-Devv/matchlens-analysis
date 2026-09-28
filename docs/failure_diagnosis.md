@@ -4,13 +4,13 @@ The exercise stops the database while the web app is serving requests, records
 how the failure shows up, restores the database, and confirms recovery without
 restarting the app. It also runs the loader during the outage.
 
-## Recorded run
+## Recorded runs
 
-Run on 28 September 2026 on Windows 11 against PostgreSQL 16.4 (portable
-binaries, started with `pg_ctl` on port 55432) and the app under `uvicorn` on
-port 8765. Docker Desktop was unavailable that day, so this run did not use the
-compose stack. The compose version of each step is in the runbook below. The
-database held the real snapshot: 38 matches, 1,042 shots.
+All runs were on 28 September 2026 on Windows 11, with the real snapshot loaded
+(38 matches, 1,042 shots). The first two used PostgreSQL 16.4 from portable
+binaries (started with `pg_ctl` on port 55432) and the app under `uvicorn` on
+port 8765, while Docker Desktop was broken. The third used the compose stack
+(Docker Desktop 4.93.0, `postgres:16-alpine`), following the runbook below.
 
 ### First run: finding a 130-second hang
 
@@ -55,6 +55,29 @@ The app recovered on its own: `pool_pre_ping` discards the dead connections and
 opens new ones on the next request. The failed import wrote nothing, because it
 never got a connection and every import is a single transaction.
 
+### Third run: compose stack
+
+| Step | Observation |
+|---|---|
+| Baseline | `GET /health` → 200 in 0.004 s |
+| `docker compose stop db` | `db: Exited (0)` |
+| `GET /health` | 503 `{"detail":"database unavailable"}` in 4.02 s |
+| `GET /` | 503 HTML error page in 3.98 s |
+| `GET /matches/3754290` | 503 HTML error page in 3.98 s |
+| `GET /api/home-away` | 503 JSON in 4.00 s |
+| `docker compose logs api`, one line per request | `database error on <path>: [Errno -2] Name or service not known` |
+| `docker compose run --rm --no-deps loader` during outage | `ERROR matchlens.loader database error: [Errno -2] Name or service not known`, exit code 1 after 6 s |
+| `docker compose start db` | `db: Up 6 seconds (healthy)` |
+| `GET /health`, `api` **not** restarted | 200 in 0.01 s |
+| `GET /matches/3754290` | 200 |
+| Row counts | 38 matches, 1,042 shots |
+
+The failure looks different under compose. A stopped container leaves the
+compose network, so the hostname `db` stops resolving. The app gets a DNS
+error, after about 4 seconds spent in Docker's resolver, instead of a connect
+timeout. The outcome is the same: fast 503s, no writes, and recovery without
+restarting `api`.
+
 The same behaviour is covered in CI by `test_database_outage_returns_503`, which
 points the app at an unreachable database and expects 503 from `/health` and
 from `/`.
@@ -84,7 +107,7 @@ The symptoms, in the order you are likely to meet them:
 curl -s -w ' [%{http_code}] %{time_total}s\n' http://127.0.0.1:8000/health
 ```
 
-Expect `{"detail":"database unavailable"} [503]` within about 3 seconds. Pages
+Expect `{"detail":"database unavailable"} [503]` within about 4 seconds. Pages
 return a 503 HTML page saying "The database is unavailable."
 
 ```bash
@@ -92,13 +115,14 @@ docker compose logs --tail 20 api
 ```
 
 Look for `database error on <path>: ...`. The text after the path points at
-the cause. Only `connection timeout expired` was seen in the recorded run; the
-other rows are typical PostgreSQL client messages for other causes:
+the cause. The first two rows were seen in the recorded runs; the others are
+typical PostgreSQL client messages for other causes:
 
 | Message | Meaning |
 |---|---|
-| `connection timeout expired` | Nothing answered within 3 s: container stopped, host down, or network partition |
-| `Connection refused` / `could not translate host name "db"` | The `db` container is not running, or the compose network is broken |
+| `[Errno -2] Name or service not known` | The `db` container is stopped, so its hostname no longer resolves (seen in the compose run) |
+| `connection timeout expired` | Nothing answered within 3 s: host down or network partition (seen in the local runs) |
+| `Connection refused` | The host is reachable but PostgreSQL is not listening, for example while it restarts |
 | `password authentication failed for user "matchlens_ro"` | Credentials changed; the init script only runs on a new volume |
 | `canceling statement due to statement timeout` | Database is up but a query ran past the read-only role's 5 s limit |
 

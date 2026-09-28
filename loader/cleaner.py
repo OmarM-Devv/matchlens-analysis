@@ -1,25 +1,30 @@
-"""Transactional, idempotent loader for StatsBomb open-data exports.
+"""Transactional, idempotent loader for one team's season from StatsBomb open data.
 
-Expected layout under ``data_dir`` (mirrors github.com/statsbomb/open-data/data):
+Default scope: Leicester City (team 22) in the Premier League 2015/16
+(competition 2, season 27): 38 matches and 1,042 shot events.
 
-    matches/<competition_id>/<season_id>.json
-    events/<match_id>.json
+Expected layout under ``data_dir`` (mirrors github.com/statsbomb/open-data/data;
+``scripts/fetch_statsbomb.py`` writes it):
 
-Each import treats the competition-season as a snapshot and runs in exactly one
-PostgreSQL transaction:
+    matches/<competition_id>/<season_id>.json   every match of the season
+    events/<match_id>.json                      one file per match of the focus team
+
+The loader keeps only the matches the focus team played. Each import treats
+that set as a snapshot and runs in exactly one PostgreSQL transaction:
 
 1. take a transaction-scoped advisory lock for the competition-season, so
-   concurrent imports of the same data serialise instead of racing;
-2. upsert ``matches`` (``INSERT ... ON CONFLICT DO UPDATE``);
-3. delete matches in the same competition-season that the snapshot no longer contains;
-4. replace every ``team_match_views`` and ``shots`` row for the snapshot's matches;
+   concurrent imports serialise instead of racing;
+2. upsert ``teams`` and ``matches`` (``INSERT ... ON CONFLICT DO UPDATE``);
+3. delete the focus team's matches in this competition-season that the
+   snapshot no longer contains (their shots cascade away);
+4. replace every ``shots`` row for the snapshot's matches;
 5. re-count what is now in the database and compare it to the snapshot.
 
-Any failure in any step rolls the whole import back, leaving the previous
-successful import untouched. Repeat runs of the same snapshot converge on the
-same rows; they never create duplicates.
+Any failure rolls the whole import back, leaving the previous successful
+import untouched. Snapshots that fail validation (including the exact 38-match
+and 1,042-shot counts) are rejected before a transaction is opened.
 
-CLI:  python -m db.loader --data-dir data/statsbomb
+CLI:  python -m loader.cleaner --data-dir data/statsbomb
 """
 
 from __future__ import annotations
@@ -37,24 +42,25 @@ from datetime import date, time
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import delete, func, insert, literal_column, select, text
-from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.exc import SQLAlchemyError
 
-from db.engine import create_db_engine, create_schema
-from db.models import Match, Shot, TeamMatchView
-
 log = logging.getLogger("matchlens.loader")
 
-# Premier League 2003/04 in the StatsBomb open-data catalogue.
-DEFAULT_COMPETITION_ID = 2
-DEFAULT_SEASON_ID = 44
-DEFAULT_EXPECTED_MATCHES = 38
-DEFAULT_EXPECTED_SHOTS = 1086
+SCHEMA_FILE = Path(__file__).resolve().parents[1] / "sql" / "schema.sql"
 
-ON_TARGET_OUTCOMES = frozenset({"Goal", "Saved", "Saved To Post"})
+# Premier League 2015/16, Leicester City, in the StatsBomb open-data catalogue.
+DEFAULT_COMPETITION_ID = 2
+DEFAULT_SEASON_ID = 27
+DEFAULT_TEAM_ID = 22
+DEFAULT_EXPECTED_MATCHES = 38
+DEFAULT_EXPECTED_SHOTS = 1042
+
 MAX_REPORTED_ERRORS = 20
+CONNECT_TIMEOUT_SECONDS = 10
+# Arbitrary constant distinguishing the schema lock from per-season import locks.
+SCHEMA_LOCK_KEY = 0x4D4C5343
 
 
 class LoaderError(Exception):
@@ -73,8 +79,9 @@ class LoadError(LoaderError):
 class Dataset:
     competition_id: int
     season_id: int
+    team_id: int
+    teams: list[dict[str, Any]]
     matches: list[dict[str, Any]]
-    team_views: list[dict[str, Any]]
     shots: list[dict[str, Any]]
 
     @property
@@ -86,16 +93,42 @@ class Dataset:
 class LoadReport:
     competition_id: int
     season_id: int
+    team_id: int
     matches_inserted: int
     matches_updated: int
     matches_pruned: int
-    team_views_written: int
     shots_written: int
     shots_replaced: int
 
-    @property
-    def matches_total(self) -> int:
-        return self.matches_inserted + self.matches_updated
+
+# --------------------------------------------------------------------------- engine and schema
+
+
+def create_db_engine(url: str | None = None, **kwargs: Any) -> Engine:
+    """Engine from ``url`` or $DATABASE_URL (psycopg 3 driver:
+    ``postgresql+psycopg://user:pass@host:5432/matchlens``)."""
+    url = url or os.environ.get("DATABASE_URL")
+    if not url:
+        raise RuntimeError("No database URL supplied and $DATABASE_URL is not set")
+    kwargs.setdefault("pool_pre_ping", True)
+    # Fail within seconds when the database is down instead of psycopg's ~130 s default.
+    kwargs.setdefault("connect_args", {"connect_timeout": CONNECT_TIMEOUT_SECONDS})
+    return create_engine(url, **kwargs)
+
+
+def apply_schema(engine: Engine) -> None:
+    """Apply sql/schema.sql. Idempotent; refuses the pre-refactor layout."""
+    ddl = SCHEMA_FILE.read_text(encoding="utf-8")
+    with engine.begin() as conn:
+        conn.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": SCHEMA_LOCK_KEY})
+        legacy = conn.execute(text("SELECT to_regclass('team_match_views')")).scalar_one()
+        if legacy is not None:
+            raise LoadError(
+                "database has the pre-refactor layout (table team_match_views);"
+                " recreate it, e.g. `docker compose down -v`, then import again"
+            )
+        # Raw cursor with no parameters, so the '%' in RAISE formats is not a placeholder.
+        conn.connection.cursor().execute(ddl)
 
 
 # --------------------------------------------------------------------------- parsing
@@ -172,72 +205,42 @@ def extract_shots(events: Iterable[Mapping[str, Any]], match_id: int) -> list[di
     ]
 
 
-def build_team_views(match: Mapping[str, Any], shots: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    """Derive the home and away perspective rows for one match.
-
-    Goals come from the official score (which includes own goals); shot and xG
-    totals come from the shot events.
-    """
-    home = (match["home_team_id"], match["home_team_name"], match["home_score"])
-    away = (match["away_team_id"], match["away_team_name"], match["away_score"])
-
-    xg_by_team: Counter[int] = Counter()
-    shots_by_team: Counter[int] = Counter()
-    on_target_by_team: Counter[int] = Counter()
-    for s in shots:
-        xg_by_team[s["team_id"]] += s["statsbomb_xg"]
-        shots_by_team[s["team_id"]] += 1
-        on_target_by_team[s["team_id"]] += s["outcome"] in ON_TARGET_OUTCOMES
-
-    views = []
-    for (team_id, team_name, gf), (opp_id, opp_name, ga), is_home in ((home, away, True), (away, home, False)):
-        if gf > ga:
-            result, points = "W", 3
-        elif gf == ga:
-            result, points = "D", 1
-        else:
-            result, points = "L", 0
-        views.append(
-            {
-                "match_id": match["match_id"],
-                "team_id": team_id,
-                "team_name": team_name,
-                "opponent_id": opp_id,
-                "opponent_name": opp_name,
-                "is_home": is_home,
-                "match_date": match["match_date"],
-                "goals_for": gf,
-                "goals_against": ga,
-                "result": result,
-                "points": points,
-                "shots": shots_by_team[team_id],
-                "shots_on_target": on_target_by_team[team_id],
-                "xg": round(xg_by_team[team_id], 6),
-                "xg_against": round(xg_by_team[opp_id], 6),
-            }
-        )
-    return views
+def involves_team(raw: Mapping[str, Any], team_id: int) -> bool:
+    home = (raw.get("home_team") or {}).get("home_team_id")
+    away = (raw.get("away_team") or {}).get("away_team_id")
+    return team_id in (home, away)
 
 
 def build_dataset(
     competition_id: int,
     season_id: int,
+    team_id: int,
     raw_matches: Sequence[Mapping[str, Any]],
     events_by_match: Mapping[int, Sequence[Mapping[str, Any]]],
 ) -> Dataset:
-    matches, team_views, shots = [], [], []
+    """Parse the focus team's matches and their shots. Team names are taken
+    from the match records; a team id seen with two names is rejected."""
+    team_names: dict[int, set[str]] = {}
+    matches, shots = [], []
     for raw in raw_matches:
+        if not involves_team(raw, team_id):
+            continue
         match = parse_match(raw)
         if match["match_id"] not in events_by_match:
             raise DataValidationError(f"match {match['match_id']}: no events file")
-        match_shots = extract_shots(events_by_match[match["match_id"]], match["match_id"])
+        for side in ("home", "away"):
+            team_names.setdefault(match[f"{side}_team_id"], set()).add(match[f"{side}_team_name"])
         matches.append(match)
-        shots.extend(match_shots)
-        team_views.extend(build_team_views(match, match_shots))
-    return Dataset(competition_id, season_id, matches, team_views, shots)
+        shots.extend(extract_shots(events_by_match[match["match_id"]], match["match_id"]))
+
+    conflicting = {tid: sorted(names) for tid, names in team_names.items() if len(names) > 1}
+    if conflicting:
+        raise DataValidationError(f"team ids with more than one name: {conflicting}")
+    teams = [{"team_id": tid, "team_name": next(iter(names))} for tid, names in sorted(team_names.items())]
+    return Dataset(competition_id, season_id, team_id, teams, matches, shots)
 
 
-def read_statsbomb(data_dir: Path | str, competition_id: int, season_id: int) -> Dataset:
+def read_statsbomb(data_dir: Path | str, competition_id: int, season_id: int, team_id: int) -> Dataset:
     root = Path(data_dir)
     matches_file = root / "matches" / str(competition_id) / f"{season_id}.json"
     raw_matches = _read_json(matches_file)
@@ -246,13 +249,15 @@ def read_statsbomb(data_dir: Path | str, competition_id: int, season_id: int) ->
 
     events_by_match: dict[int, Sequence[Mapping[str, Any]]] = {}
     for raw in raw_matches:
-        match_id = raw.get("match_id") if isinstance(raw, dict) else None
+        if not isinstance(raw, dict) or not involves_team(raw, team_id):
+            continue
+        match_id = raw.get("match_id")
         if not isinstance(match_id, int):
             continue  # parse_match reports the malformed record
         events_file = root / "events" / f"{match_id}.json"
         if events_file.exists():
             events_by_match[match_id] = _read_json(events_file)
-    return build_dataset(competition_id, season_id, raw_matches, events_by_match)
+    return build_dataset(competition_id, season_id, team_id, raw_matches, events_by_match)
 
 
 def _read_json(path: Path) -> Any:
@@ -278,7 +283,7 @@ def validate_dataset(
     errors: list[str] = []
 
     if not dataset.matches:
-        errors.append("snapshot contains no matches")
+        errors.append(f"snapshot contains no matches for team {dataset.team_id}")
     if expected_matches is not None and len(dataset.matches) != expected_matches:
         errors.append(f"expected {expected_matches} matches, found {len(dataset.matches)}")
     if expected_shots is not None and len(dataset.shots) != expected_shots:
@@ -311,7 +316,36 @@ def validate_dataset(
 
 # --------------------------------------------------------------------------- persistence
 
-_MATCH_UPDATE_COLUMNS = [c.name for c in Match.__table__.columns if c.name not in ("match_id", "loaded_at")]
+_MATCH_COLUMNS = [
+    "match_id", "competition_id", "season_id", "season_name", "match_date", "kick_off",
+    "match_week", "home_team_id", "away_team_id", "home_score", "away_score",
+    "stadium_name", "referee_name",
+]
+_SHOT_COLUMNS = [
+    "shot_id", "match_id", "team_id", "player_id", "player_name", "event_index", "period",
+    "minute", "second", "location_x", "location_y", "end_location_x", "end_location_y",
+    "statsbomb_xg", "outcome", "body_part", "technique", "shot_type", "play_pattern",
+    "under_pressure", "first_time",
+]
+
+
+def _insert_sql(table: str, columns: Sequence[str], suffix: str = "") -> Any:
+    cols = ", ".join(columns)
+    binds = ", ".join(f":{c}" for c in columns)
+    return text(f"INSERT INTO {table} ({cols}) VALUES ({binds}) {suffix}")
+
+
+UPSERT_TEAM = _insert_sql(
+    "teams", ["team_id", "team_name"],
+    "ON CONFLICT (team_id) DO UPDATE SET team_name = EXCLUDED.team_name",
+)
+UPSERT_MATCH = _insert_sql(
+    "matches", _MATCH_COLUMNS,
+    "ON CONFLICT (match_id) DO UPDATE SET "
+    + ", ".join(f"{c} = EXCLUDED.{c}" for c in _MATCH_COLUMNS if c != "match_id")
+    + ", loaded_at = now()",
+)
+INSERT_SHOT = _insert_sql("shots", _SHOT_COLUMNS)
 
 
 def load_dataset(engine: Engine, dataset: Dataset) -> LoadReport:
@@ -334,37 +368,43 @@ def _load_in_transaction(conn: Connection, ds: Dataset) -> LoadReport:
         {"competition_id": ds.competition_id, "season_id": ds.season_id},
     )
     match_ids = ds.match_ids
-    matches = Match.__table__
-    in_scope = (matches.c.competition_id == ds.competition_id) & (matches.c.season_id == ds.season_id)
+    scope = {"competition_id": ds.competition_id, "season_id": ds.season_id, "team_id": ds.team_id}
 
-    upsert = pg_insert(matches).values(ds.matches)
-    upsert = upsert.on_conflict_do_update(
-        index_elements=[matches.c.match_id],
-        set_={**{col: upsert.excluded[col] for col in _MATCH_UPDATE_COLUMNS}, "loaded_at": func.now()},
-    ).returning(literal_column("(xmax = 0)").label("inserted"))
-    inserted_flags = conn.execute(upsert).scalars().all()
-    inserted = sum(1 for flag in inserted_flags if flag)
+    existing = conn.execute(
+        text("SELECT COUNT(*) FROM matches WHERE match_id = ANY(:ids)"), {"ids": match_ids}
+    ).scalar_one()
+
+    conn.execute(UPSERT_TEAM, ds.teams)
+    conn.execute(UPSERT_MATCH, ds.matches)
 
     pruned = conn.execute(
-        delete(matches).where(in_scope, matches.c.match_id.not_in(match_ids))
+        text(
+            """
+            DELETE FROM matches
+            WHERE competition_id = :competition_id AND season_id = :season_id
+              AND :team_id IN (home_team_id, away_team_id)
+              AND match_id <> ALL(:ids)
+            """
+        ),
+        {**scope, "ids": match_ids},
     ).rowcount
 
-    # Children are replaced wholesale so events removed upstream disappear too.
-    shots_replaced = conn.execute(delete(Shot).where(Shot.match_id.in_(match_ids))).rowcount
-    conn.execute(delete(TeamMatchView).where(TeamMatchView.match_id.in_(match_ids)))
-    conn.execute(insert(TeamMatchView), ds.team_views)
+    # Shots are replaced wholesale so events removed upstream disappear too.
+    shots_replaced = conn.execute(
+        text("DELETE FROM shots WHERE match_id = ANY(:ids)"), {"ids": match_ids}
+    ).rowcount
     if ds.shots:
-        conn.execute(insert(Shot), ds.shots)
+        conn.execute(INSERT_SHOT, ds.shots)
 
     _verify_counts(conn, ds)
 
     report = LoadReport(
         competition_id=ds.competition_id,
         season_id=ds.season_id,
-        matches_inserted=inserted,
-        matches_updated=len(inserted_flags) - inserted,
+        team_id=ds.team_id,
+        matches_inserted=len(match_ids) - existing,
+        matches_updated=existing,
         matches_pruned=pruned,
-        team_views_written=len(ds.team_views),
         shots_written=len(ds.shots),
         shots_replaced=shots_replaced,
     )
@@ -373,18 +413,25 @@ def _load_in_transaction(conn: Connection, ds: Dataset) -> LoadReport:
 
 
 def _verify_counts(conn: Connection, ds: Dataset) -> None:
-    scope = (Match.competition_id == ds.competition_id) & (Match.season_id == ds.season_id)
-    n_matches = conn.execute(select(func.count()).select_from(Match).where(scope)).scalar_one()
-    n_views = conn.execute(
-        select(func.count()).select_from(TeamMatchView).join(Match).where(scope)
-    ).scalar_one()
-    n_shots = conn.execute(select(func.count()).select_from(Shot).join(Match).where(scope)).scalar_one()
-
-    expected = (len(ds.matches), len(ds.team_views), len(ds.shots))
-    if (n_matches, n_views, n_shots) != expected:
+    n_matches, n_shots = conn.execute(
+        text(
+            """
+            SELECT
+                (SELECT COUNT(*) FROM matches AS m
+                 WHERE m.competition_id = :competition_id AND m.season_id = :season_id
+                   AND :team_id IN (m.home_team_id, m.away_team_id)),
+                (SELECT COUNT(*) FROM shots AS s JOIN matches AS m USING (match_id)
+                 WHERE m.competition_id = :competition_id AND m.season_id = :season_id
+                   AND :team_id IN (m.home_team_id, m.away_team_id))
+            """
+        ),
+        {"competition_id": ds.competition_id, "season_id": ds.season_id, "team_id": ds.team_id},
+    ).one()
+    expected = (len(ds.matches), len(ds.shots))
+    if (n_matches, n_shots) != expected:
         raise LoadError(
-            f"post-load verification failed: database has matches/views/shots ="
-            f" {(n_matches, n_views, n_shots)}, snapshot has {expected}"
+            f"post-load verification failed: database has matches/shots ="
+            f" {(n_matches, n_shots)}, snapshot has {expected}"
         )
 
 
@@ -393,12 +440,13 @@ def import_statsbomb(
     data_dir: Path | str,
     competition_id: int = DEFAULT_COMPETITION_ID,
     season_id: int = DEFAULT_SEASON_ID,
+    team_id: int = DEFAULT_TEAM_ID,
     *,
     expected_matches: int | None = None,
     expected_shots: int | None = None,
 ) -> LoadReport:
-    """Read, validate and load one competition-season snapshot."""
-    dataset = read_statsbomb(data_dir, competition_id, season_id)
+    """Read, validate and load one team's competition-season snapshot."""
+    dataset = read_statsbomb(data_dir, competition_id, season_id, team_id)
     validate_dataset(dataset, expected_matches=expected_matches, expected_shots=expected_shots)
     return load_dataset(engine, dataset)
 
@@ -411,10 +459,11 @@ def _env_int(name: str, default: int) -> int:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Load StatsBomb open data into MatchLens.")
+    parser = argparse.ArgumentParser(description="Load one team's StatsBomb season into MatchLens.")
     parser.add_argument("--data-dir", default=os.environ.get("MATCHLENS_DATA_DIR", "data/statsbomb"))
     parser.add_argument("--competition-id", type=int, default=_env_int("MATCHLENS_COMPETITION_ID", DEFAULT_COMPETITION_ID))
     parser.add_argument("--season-id", type=int, default=_env_int("MATCHLENS_SEASON_ID", DEFAULT_SEASON_ID))
+    parser.add_argument("--team-id", type=int, default=_env_int("MATCHLENS_TEAM_ID", DEFAULT_TEAM_ID))
     parser.add_argument("--expected-matches", type=int, default=_env_int("MATCHLENS_EXPECTED_MATCHES", DEFAULT_EXPECTED_MATCHES))
     parser.add_argument("--expected-shots", type=int, default=_env_int("MATCHLENS_EXPECTED_SHOTS", DEFAULT_EXPECTED_SHOTS))
     parser.add_argument("--no-count-check", action="store_true", help="skip the expected match/shot count check")
@@ -425,26 +474,29 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     engine = create_db_engine(args.database_url)
     try:
-        create_schema(engine)
+        apply_schema(engine)
         report = import_statsbomb(
             engine,
             args.data_dir,
             args.competition_id,
             args.season_id,
+            args.team_id,
             expected_matches=None if args.no_count_check else args.expected_matches,
             expected_shots=None if args.no_count_check else args.expected_shots,
         )
     except LoaderError as exc:
         log.error("%s", exc)
         return 1
+    except SQLAlchemyError as exc:
+        log.error("database error: %s", getattr(exc, "orig", exc))
+        return 1
     finally:
         engine.dispose()
 
     print(
-        f"Loaded competition {report.competition_id} season {report.season_id}: "
+        f"Loaded team {report.team_id}, competition {report.competition_id} season {report.season_id}: "
         f"{report.matches_inserted} matches inserted, {report.matches_updated} updated, "
-        f"{report.matches_pruned} pruned; {report.team_views_written} team views; "
-        f"{report.shots_written} shots ({report.shots_replaced} replaced)."
+        f"{report.matches_pruned} pruned; {report.shots_written} shots ({report.shots_replaced} replaced)."
     )
     return 0
 

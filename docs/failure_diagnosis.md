@@ -1,0 +1,152 @@
+# Failure exercise: controlled PostgreSQL outage
+
+The exercise stops the database while the web app is serving requests, records
+how the failure shows up, restores the database, and confirms recovery without
+restarting the app. It also runs the loader during the outage.
+
+## Recorded run
+
+Run on 28 September 2026 on Windows 11 against PostgreSQL 16.4 (portable
+binaries, started with `pg_ctl` on port 55432) and the app under `uvicorn` on
+port 8765. Docker Desktop was unavailable that day, so this run did not use the
+compose stack. The compose version of each step is in the runbook below. The
+database held the real snapshot: 38 matches, 1,042 shots.
+
+### First run: finding a 130-second hang
+
+| Step | Observation |
+|---|---|
+| Baseline | `GET /health` → 200 `{"status":"ok"}` |
+| Stop PostgreSQL (`pg_ctl stop -m fast`) | server stopped |
+| `GET /health` during outage | 503 `{"detail":"database unavailable"}` after **130.06 s** |
+| App log | `database error on /health: connection timeout expired` |
+
+The 503 was correct, but each request held a worker for more than two minutes.
+Two things combined. `pool_pre_ping` found the pooled connection dead and
+discarded it. The replacement connection attempt then had no `connect_timeout`,
+so psycopg waited 130 seconds, its default connection deadline, before giving
+up. With two uvicorn workers, a few concurrent requests during an outage would
+leave the app unresponsive even after the database came back.
+
+**Fix:** the app's engine now sets `connect_timeout=3` (`CONNECT_TIMEOUT_SECONDS`
+in `app/main.py`). The loader sets `connect_timeout=10`
+(`CONNECT_TIMEOUT_SECONDS` in `loader/cleaner.py`).
+
+### Second run, with the fix
+
+| Step | Observation |
+|---|---|
+| Baseline | `GET /health` → 200 in 0.01 s |
+| Stop PostgreSQL | server stopped |
+| `GET /health` | 503 `{"detail":"database unavailable"}` in 3.04 s |
+| `GET /` | 503 HTML error page in 3.05 s |
+| `GET /matches/3754290` | 503 HTML error page in 3.01 s |
+| `GET /api/home-away` | 503 JSON in 3.03 s |
+| App log, one line per request | `database error on <path>: connection timeout expired` |
+| `python -m loader.cleaner` during outage | `ERROR matchlens.loader database error: connection timeout expired`, exit code 1 after 12 s |
+| Start PostgreSQL (`pg_ctl start`) | server started |
+| `GET /health`, app **not** restarted | 200 in 0.12 s |
+| `GET /matches/3754290` | 200 |
+| `GET /api/home-away` | 200, Home 19 played, 12 W, 6 D, 1 L |
+| Row counts | 38 matches, 1,042 shots, unchanged by the failed import |
+| `python -m loader.cleaner` after restore | 0 inserted, 38 updated, 1,042 shots replaced; exit code 0 |
+
+The app recovered on its own: `pool_pre_ping` discards the dead connections and
+opens new ones on the next request. The failed import wrote nothing, because it
+never got a connection and every import is a single transaction.
+
+The same behaviour is covered in CI by `test_database_outage_returns_503`, which
+points the app at an unreachable database and expects 503 from `/health` and
+from `/`.
+
+## Runbook (compose stack)
+
+### 1. Confirm the healthy state
+
+```bash
+docker compose ps
+curl -s http://127.0.0.1:8000/health
+```
+
+Expect `db` healthy, `api` running, and `{"status":"ok"}`.
+
+### 2. Cause the outage
+
+```bash
+docker compose stop db
+```
+
+### 3. Diagnose
+
+The symptoms, in the order you are likely to meet them:
+
+```bash
+curl -s -w ' [%{http_code}] %{time_total}s\n' http://127.0.0.1:8000/health
+```
+
+Expect `{"detail":"database unavailable"} [503]` within about 3 seconds. Pages
+return a 503 HTML page saying "The database is unavailable."
+
+```bash
+docker compose logs --tail 20 api
+```
+
+Look for `database error on <path>: ...`. The text after the path points at
+the cause. Only `connection timeout expired` was seen in the recorded run; the
+other rows are typical PostgreSQL client messages for other causes:
+
+| Message | Meaning |
+|---|---|
+| `connection timeout expired` | Nothing answered within 3 s: container stopped, host down, or network partition |
+| `Connection refused` / `could not translate host name "db"` | The `db` container is not running, or the compose network is broken |
+| `password authentication failed for user "matchlens_ro"` | Credentials changed; the init script only runs on a new volume |
+| `canceling statement due to statement timeout` | Database is up but a query ran past the read-only role's 5 s limit |
+
+```bash
+docker compose ps db
+docker compose logs --tail 50 db
+```
+
+`docker compose ps` shows `exited` for a stopped container. For a crash, the
+database log shows the reason, such as a full disk or bad configuration.
+
+### 4. Restore
+
+```bash
+docker compose start db
+docker compose ps db
+```
+
+Wait until `db` reports `healthy`, then check the app. It should recover without
+a restart:
+
+```bash
+curl -s http://127.0.0.1:8000/health
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8000/
+```
+
+Expect `{"status":"ok"}` and `200`.
+
+### 5. Verify the data
+
+The app never writes, so an outage cannot damage data through it. An import
+interrupted by the outage rolls back as a single transaction. To confirm:
+
+```bash
+docker compose exec db psql -U matchlens -d matchlens -c "SELECT (SELECT count(*) FROM matches) AS matches, (SELECT count(*) FROM shots) AS shots"
+```
+
+Expect 38 matches and 1,042 shots. If an import was running when the database
+stopped, run it again. Imports are idempotent:
+
+```bash
+docker compose run --rm loader
+```
+
+## What the exercise does not cover
+
+- A long outage under real traffic. Each request still holds a worker for up to
+  3 seconds, so heavy traffic during an outage would still queue.
+- Data loss or corruption inside PostgreSQL. Recovering from that needs backups,
+  and the project has none.
+- Failover. There is a single database instance.

@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% set h = report.home %}{% set a = report.away %}
+{% block title %}MatchLens · {{ h.team_name }} {{ h.goals_for }}–{{ a.goals_for }} {{ a.team_name }}{% endblock %}
+{% block content %}
+  <nav class="top">
+    <a href="/">← Season overview</a>
+    {% if previous_id %} · <a href="/matches/{{ previous_id }}">previous match</a>{% endif %}
+    {% if next_id %} · <a href="/matches/{{ next_id }}">next match</a>{% endif %}
+  </nav>
+  <h1>{{ h.team_name }} {{ h.goals_for }}–{{ a.goals_for }} {{ a.team_name }}</h1>
+  <p class="sub">{{ report.match_date.strftime("%d %B %Y") }}{% if report.match_week %} · matchweek {{ report.match_week }}{% endif %}</p>
+
+  <div class="card">
+    <table>
+      <thead>
+        <tr><th class="l">Metric</th><th>{{ h.team_name }}</th><th>{{ a.team_name }}</th></tr>
+      </thead>
+      <tbody>
+        <tr><td class="l">Result</td>
+            <td><span class="res {{ h.result }}">{{ h.result }}</span></td>
+            <td><span class="res {{ a.result }}">{{ a.result }}</span></td></tr>
+        <tr><td class="l">Points</td><td>{{ h.points }}</td><td>{{ a.points }}</td></tr>
+        <tr><td class="l">Goals (official)</td><td>{{ h.goals_for }}</td><td>{{ a.goals_for }}</td></tr>
+        <tr><td class="l">Goals from shots</td><td>{{ h.shot_goals }}</td><td>{{ a.shot_goals }}</td></tr>
+        <tr><td class="l">Goals not from shots (own goals)</td><td>{{ h.goals_not_from_shots }}</td><td>{{ a.goals_not_from_shots }}</td></tr>
+        <tr><td class="l">Shots</td><td>{{ h.shots }}</td><td>{{ a.shots }}</td></tr>
+        <tr><td class="l">Shots on target</td><td>{{ h.shots_on_target }}</td><td>{{ a.shots_on_target }}</td></tr>
+        <tr><td class="l">xG (StatsBomb)</td><td>{{ "%.2f"|format(h.xg) }}</td><td>{{ "%.2f"|format(a.xg) }}</td></tr>
+        <tr><td class="l">xG per shot</td>
+            <td>{{ "%.3f"|format(h.xg_per_shot) if h.xg_per_shot is not none else "–" }}</td>
+            <td>{{ "%.3f"|format(a.xg_per_shot) if a.xg_per_shot is not none else "–" }}</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="note">Official goals include own goals, which StatsBomb records as separate events rather than shots.
+    Shots on target are shots with outcome Goal, Saved or Saved to Post.</p>
+{% endblock %}

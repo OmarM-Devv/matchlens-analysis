@@ -9,24 +9,28 @@ Descriptive match analysis of Leicester City's 2015/16 Premier League season, bu
 The match-report page (`/matches/{match_id}`), captured from a local run against
 the loaded 2015/16 data.
 
-## At a Glance
+## Overview
 
-| | |
-|---|---|
-| What it does | Loads one team's season of StatsBomb event data into PostgreSQL, validates it, and serves match reports, rolling form and home/away splits as web pages and JSON |
-| Data | 38 matches and 1,042 shot events: Premier League 2015/16 (StatsBomb competition 2, season 27), Leicester City (team 22) |
-| Stack | Python 3.12, PostgreSQL 16, SQLAlchemy 2.0, FastAPI, Docker Compose, GitHub Actions |
-| Tests | 16 PostgreSQL integration tests (31 assertions), run in CI on every push to `main` and every pull request |
-| Status | Runs locally under Docker Compose. CI only; not deployed |
-| Evidence | [System verification](#system-verification): screenshots, each with the command that reproduces it. [Failure exercise](docs/failure_diagnosis.md): a recorded database outage |
-| Design decisions | Four [architecture decision records](docs/adr/) covering the options considered and the trade-offs |
+I built MatchLens to practise loading real event data into a database and
+answering questions about it with SQL. It covers Leicester City's 2015/16
+Premier League season from StatsBomb's open data: 38 matches and 1,042 shot
+events.
 
-The cloud deployment side of my work (Terraform, AWS, OIDC, CI/CD) is in
+A Python loader checks the whole snapshot before writing anything, then loads
+it into PostgreSQL in a single transaction. The schema and the analysis
+queries live in their own `sql/` folder, and a small FastAPI app serves match
+reports, rolling form and a home vs away comparison as web pages and JSON. It
+runs locally under Docker Compose, and GitHub Actions runs the 16 integration
+tests on every push. It is not deployed.
+
+The main design decisions and their trade-offs are recorded in
+[`docs/adr/`](docs/adr/). The cloud deployment side of my work (Terraform, AWS
+and CI/CD) is in
 [rail-data-pipeline-api](https://github.com/OmarM-Devv/rail-data-pipeline-api).
 
-## Skills Demonstrated
+## How It's Built
 
-### Software engineering
+### Code and Tests
 
 - **Separation of concerns.** SQL lives in [`sql/`](sql/), not in Python
   strings. The loader ([`loader/cleaner.py`](loader/cleaner.py)) parses,
@@ -57,7 +61,7 @@ The cloud deployment side of my work (Terraform, AWS, OIDC, CI/CD) is in
   idempotency, upstream corrections, pruning, rollback, concurrent imports,
   schema constraints, the aggregate-before-join totals and a database outage.
 
-### Data engineering
+### Data Pipeline
 
 - **Scoped, guarded ingestion.** The import is pinned to competition 2,
   season 27, team 22 and refuses a snapshot unless it has exactly 38 matches
@@ -84,7 +88,7 @@ The cloud deployment side of my work (Terraform, AWS, OIDC, CI/CD) is in
 - **Orchestrated run order.** Compose starts the database, waits for it to be
   healthy, runs the loader to completion, and only then starts the API.
 
-### DevOps
+### Containers and CI
 
 - **Container image.** Multi-stage [`Dockerfile`](Dockerfile): dependencies
   resolved in a builder stage, a slim runtime running as non-root UID 10001, a
@@ -557,6 +561,36 @@ query-plan notes:
   loader's count guard.
 - At 1,042 shots, PostgreSQL chooses a sequential scan over the covering index;
   the home/away query executed in about 1 ms.
+
+## What I Learned
+
+- Checking the whole snapshot before opening a transaction, then writing it in
+  one transaction, means a failed import never leaves half the data behind.
+- Joining raw shots to per-match results repeats each match's points once per
+  shot. The numbers still look plausible, so I aggregate shots before joining
+  and pinned the correct totals with a test.
+- One missing value doesn't have to block a whole batch. Setting aside shots
+  without xG, while still counting them, keeps the load going without hiding
+  the problem.
+- A database connection with no timeout can hang for over two minutes when the
+  database is down. I found this in a controlled outage and fixed it with
+  connect timeouts.
+- An index isn't automatically used. At 1,042 rows PostgreSQL chose a
+  sequential scan, which I only knew because I checked the plan with
+  `EXPLAIN ANALYZE`.
+- Integration tests against a real PostgreSQL database catch problems that
+  mocks would hide, such as constraint and trigger behaviour.
+
+## Future Improvements
+
+These are future ideas, not completed parts of this project:
+
+- Use a migration tool such as Alembic instead of recreating the database when
+  the schema changes.
+- Load more teams and seasons, which would need batching and a fresh look at
+  the indexes.
+- Add authentication and caching before any public deployment.
+- Deploy it, reusing the approach from rail-data-pipeline-api.
 
 Data: [StatsBomb open data](https://github.com/statsbomb/open-data), used under
 its licence terms with attribution.

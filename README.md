@@ -28,6 +28,14 @@ The main design decisions and their trade-offs are recorded in
 and CI/CD) is in
 [rail-data-pipeline-api](https://github.com/OmarM-Devv/rail-data-pipeline-api).
 
+## Project History
+
+| When | What |
+|---|---|
+| About four weeks before 28/09/2026 | Built the schema, loader, web app, integration tests and Docker Compose stack locally |
+| 28/09/2026 | Published the repository with GitHub Actions CI. Ran the [failure exercise](#failure-exercise), which found and fixed a 130-second hang, and repeated it on the Compose stack once Docker Desktop was working again |
+| 28/09/2026 | Added the architecture decision records and the System Verification screenshots |
+
 ## How It's Built
 
 ### Code and Tests
@@ -575,6 +583,13 @@ query-plan notes:
 - A database connection with no timeout can hang for over two minutes when the
   database is down. I found this in a controlled outage and fixed it with
   connect timeouts.
+- **Docker Desktop broke part-way through that exercise.** I ran the first two
+  outage runs against a portable PostgreSQL started with `pg_ctl` instead,
+  then repeated the exercise on the Compose stack once Docker was repaired.
+  The results differed. Under Compose a stopped container's hostname stops
+  resolving, so the app failed in about 4 seconds with
+  `Name or service not known` instead of hitting the connect timeout. Testing
+  on the real deployment setup matters.
 - An index isn't automatically used. At 1,042 rows PostgreSQL chose a
   sequential scan, which I only knew because I checked the plan with
   `EXPLAIN ANALYZE`.
